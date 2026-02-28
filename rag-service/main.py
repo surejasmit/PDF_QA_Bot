@@ -17,12 +17,14 @@ from transformers import (
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from pathlib import Path
+from contextlib import asynccontextmanager
 import uvicorn
 import torch
 import os
 import re
 import time
 import docx
+import asyncio
 
 # ===============================
 # APP SETUP
@@ -32,7 +34,20 @@ load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent.parent
 UPLOAD_DIR = (BASE_DIR / "uploads").resolve()
 
-app = FastAPI()
+cleanup_task = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global cleanup_task
+    cleanup_task = asyncio.create_task(background_cleanup())
+    yield
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
+
+app = FastAPI(lifespan=lifespan)
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 
@@ -186,6 +201,11 @@ def cleanup_sessions():
                if now - v["last"] > SESSION_TIMEOUT]
     for k in expired:
         del sessions[k]
+
+async def background_cleanup():
+    while True:
+        await asyncio.sleep(300)
+        cleanup_sessions()
 
 
 # ===============================
