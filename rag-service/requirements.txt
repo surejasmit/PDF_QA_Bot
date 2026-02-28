@@ -14,4 +14,20 @@ python-docx
 requests
 numpy
 slowapi
+pdf2image
+pytesseract
+Pillow
+
+# Authentication dependencies
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+sqlalchemy
+alembic
+
+# Testing dependencies
+pytest
+pytest-asyncio
+httpx
+pytest-mock
 groq
