@@ -10,18 +10,18 @@ from dotenv import load_dotenv
 from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
-from contextlib import asynccontextmanager
 from slowapi.errors import RateLimitExceeded
+from contextlib import asynccontextmanager
 from uuid import uuid4
-import uvicorn
-import torch
 import os
 import time
+import torch
+import uvicorn
 import asyncio
 import pdf2image
 import pytesseract
 
-# Prompt helpers
+# Prompt + post-processing helpers
 from utils.postprocess import extract_final_answer, extract_final_summary, extract_comparison
 from utils.prompt_templates import build_ask_prompt, build_summarize_prompt, build_compare_prompt
 
@@ -29,17 +29,17 @@ from utils.prompt_templates import build_ask_prompt, build_summarize_prompt, bui
 load_dotenv()
 
 # ===============================
-# SESSION CLEANUP (MERGED FIX)
+# SESSION + CLEANUP
 # ===============================
 sessions = {}
 SESSION_TIMEOUT = 3600
 
 
 def cleanup_expired_sessions():
-    current_time = time.time()
+    now = time.time()
     expired = [
         sid for sid, data in sessions.items()
-        if current_time - data["last_accessed"] > SESSION_TIMEOUT
+        if now - data["last_accessed"] > SESSION_TIMEOUT
     ]
     for sid in expired:
         del sessions[sid]
@@ -63,7 +63,7 @@ async def lifespan(app: FastAPI):
 # ===============================
 app = FastAPI(
     title="PDF QA Bot API",
-    version="2.2.0",
+    version="2.3.0",
     lifespan=lifespan
 )
 
@@ -86,7 +86,7 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ===============================
-# EMBEDDINGS
+# EMBEDDING MODEL
 # ===============================
 embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
@@ -150,53 +150,80 @@ class CompareRequest(BaseModel):
 
 
 # ===============================
-# UPLOAD + OCR
+# HEALTH
+# ===============================
+@app.get("/healthz")
+def health_check():
+    return {"status": "healthy"}
+
+
+# ===============================
+# UPLOAD + OCR + SECURITY
 # ===============================
 @app.post("/upload")
 @limiter.limit("10/15 minutes")
-async def upload(request: Request, file: UploadFile = File(...)):
-
+async def upload_file(request: Request, file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".pdf"):
-        return {"error": "Only PDF allowed"}
+        return {"error": "Only PDF supported"}
 
     session_id = str(uuid4())
-    os.makedirs("uploads", exist_ok=True)
-    file_path = f"uploads/{uuid4().hex}_{file.filename}"
 
-    with open(file_path, "wb") as f:
-        f.write(await file.read())
+    upload_dir = "uploads"
+    os.makedirs(upload_dir, exist_ok=True)
 
-    loader = PyPDFLoader(file_path)
-    docs = loader.load()
+    file_path = os.path.join(upload_dir, f"{uuid4().hex}.pdf")
 
-    # OCR fallback
-    final_docs = []
-    images = None
+    try:
+        with open(file_path, "wb") as buffer:
+            buffer.write(await file.read())
 
-    for i, doc in enumerate(docs):
-        if len(doc.page_content.strip()) < 50:
-            if images is None:
-                images = pdf2image.convert_from_path(file_path)
+        docs = PyPDFLoader(file_path).load()
 
-            ocr_text = pytesseract.image_to_string(images[i])
-            final_docs.append(Document(page_content=ocr_text))
-        else:
-            final_docs.append(doc)
+        # OCR fallback
+        final_docs = []
+        images = None
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=100,
-    )
+        for i, doc in enumerate(docs):
+            if len(doc.page_content.strip()) < 50:
+                if images is None:
+                    images = pdf2image.convert_from_path(file_path)
 
-    chunks = splitter.split_documents(final_docs)
-    vectorstore = FAISS.from_documents(chunks, embedding_model)
+                ocr_text = pytesseract.image_to_string(images[i])
+                final_docs.append(
+                    Document(
+                        page_content=ocr_text,
+                        metadata={"page": i}
+                    )
+                )
+            else:
+                final_docs.append(doc)
 
-    sessions[session_id] = {
-        "vectorstores": [vectorstore],
-        "last_accessed": time.time(),
-    }
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=100,
+        )
 
-    return {"session_id": session_id}
+        chunks = splitter.split_documents(final_docs)
+
+        if not chunks:
+            return {"error": "No extractable text"}
+
+        vectorstore = FAISS.from_documents(chunks, embedding_model)
+
+        sessions[session_id] = {
+            "vectorstores": [vectorstore],
+            "filename": file.filename,
+            "last_accessed": time.time()
+        }
+
+        return {
+            "message": "Upload successful",
+            "session_id": session_id
+        }
+
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
 
 # ===============================
@@ -205,24 +232,38 @@ async def upload(request: Request, file: UploadFile = File(...)):
 @app.post("/ask")
 @limiter.limit("60/15 minutes")
 def ask(request: Request, data: AskRequest):
-
     cleanup_expired_sessions()
 
-    vectorstores = []
+    if not data.session_ids:
+        return {"answer": "No session selected."}
+
+    docs_meta = []
+
     for sid in data.session_ids:
         session = sessions.get(sid)
-        if session:
-            session["last_accessed"] = time.time()
-            vectorstores.extend(session["vectorstores"])
+        if not session:
+            continue
 
-    docs = []
-    for vs in vectorstores:
-        docs.extend(vs.similarity_search(data.question, k=4))
+        session["last_accessed"] = time.time()
+        vs = session["vectorstores"][0]
 
-    context = "\n\n".join(d.page_content for d in docs)
+        retrieved = vs.similarity_search(data.question, k=4)
+
+        for d in retrieved:
+            docs_meta.append({
+                "doc": d,
+                "filename": session.get("filename", "unknown")
+            })
+
+    if not docs_meta:
+        return {"answer": "No relevant info"}
+
+    context = "\n\n".join(
+        f"[Page {d['doc'].metadata.get('page',0)+1}] {d['doc'].page_content}"
+        for d in docs_meta
+    )
 
     prompt = build_ask_prompt(context=context, question=data.question)
-
     raw = generate_response(prompt)
     answer = extract_final_answer(raw)
 
@@ -234,53 +275,49 @@ def ask(request: Request, data: AskRequest):
 # ===============================
 @app.post("/summarize")
 def summarize(data: SummarizeRequest):
-
-    vectorstores = []
-    for sid in data.session_ids:
-        session = sessions.get(sid)
-        if session:
-            vectorstores.extend(session["vectorstores"])
-
-    docs = []
-    for vs in vectorstores:
-        docs.extend(vs.similarity_search("summary", k=6))
-
-    context = "\n\n".join(d.page_content for d in docs)
-
-    prompt = build_summarize_prompt(context=context)
-
-    raw = generate_response(prompt, 300)
-    summary = extract_final_summary(raw)
-
-    return {"summary": summary}
-
-
-# ===============================
-# COMPARE
-# ===============================
-@app.post("/compare")
-def compare(data: CompareRequest):
-
     contexts = []
+
     for sid in data.session_ids:
         session = sessions.get(sid)
         if session:
             vs = session["vectorstores"][0]
-            chunks = vs.similarity_search("main topic", k=4)
-            contexts.append("\n".join(c.page_content for c in chunks))
+            chunks = vs.similarity_search("summary", k=6)
+            contexts.extend(c.page_content for c in chunks)
 
-    prompt = build_compare_prompt(contexts)
+    prompt = build_summarize_prompt(context="\n\n".join(contexts))
+    raw = generate_response(prompt, 300)
 
+    return {"summary": extract_final_summary(raw)}
+
+
+# ===============================
+# COMPARE (FIXED BUG)
+# ===============================
+@app.post("/compare")
+def compare(data: CompareRequest):
+    if len(data.session_ids) < 2:
+        return {"comparison": "Select at least 2 docs"}
+
+    per_doc_contexts = []
+
+    for sid in data.session_ids:
+        session = sessions.get(sid)
+        if not session:
+            continue
+
+        vs = session["vectorstores"][0]
+        chunks = vs.similarity_search("main topic", k=4)
+        text = "\n".join(c.page_content for c in chunks)
+        per_doc_contexts.append(text)
+
+    prompt = build_compare_prompt(per_doc_contexts=per_doc_contexts)
     raw = generate_response(prompt, 400)
-    comparison = extract_comparison(raw)
 
-    return {"comparison": comparison}
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+    return {"comparison": extract_comparison(raw)}
 
 
+# ===============================
+# START
+# ===============================
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=5000)
